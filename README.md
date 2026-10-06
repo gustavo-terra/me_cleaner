@@ -1,3 +1,16 @@
+# DISCLAIMER
+
+This fork is an experimental project for research and analysis of Intel ME/TXE
+firmware images. Do not use it expecting improved security or privacy.
+We make no such guarantee, and it is not our goal.
+
+Modified images may fail to boot, behave unpredictably and even cause 
+permanent physical damage. Use it only on hardware your own, and keep a verified
+backup of the original flash dump. Provided "as is", without warranty, under the
+GPLv3.
+
+Below, the original README from me_cleaner.
+
 # me\_cleaner
 
 _me\_cleaner_ is a Python script able to modify an Intel ME firmware image with
