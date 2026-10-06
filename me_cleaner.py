@@ -21,6 +21,7 @@ import binascii
 import hashlib
 import itertools
 import shutil
+import struct
 import sys
 from struct import pack, unpack
 
@@ -153,7 +154,282 @@ def get_chunks_offsets(llut):
     return offsets
 
 
-def remove_modules(f, mod_headers, ftpr_offset, me_end):
+def parse_keep_modules(arg):
+    """Convert the argument of --keep-modules ("MODULE_A,MODULE_B") in a set
+    of module names"""
+
+    if arg is None:
+        return set()
+
+    modules = set(m.strip() for m in arg.split(",") if m.strip())
+
+    if not modules:
+        sys.exit("-k requires a comma separated list of modules "
+                 "(MODULE_A,MODULE_B)")
+
+    return modules
+
+
+def parse_partition_entry(partition, is_last, variant, version,
+                          me_start, me_end):
+    """Decode a 0x20 bytes FPT partition entry"""
+
+    flags = unpack("<I", partition[0x1c:0x20])[0]
+
+    try:
+        part_name = partition[0x0:0x4].rstrip(b"\x00").decode("ascii")
+    except UnicodeDecodeError:
+        part_name = "????"
+
+    part_start, part_length = unpack("<II", partition[0x08:0x10])
+
+    # ME 6: the last partition has 0xffffffff as size
+    if variant == "ME" and version[0] == 6 and is_last and \
+       part_length == 0xffffffff:
+        part_length = me_end - me_start - part_start
+
+    part_end = part_start + part_length
+
+    return part_name, flags, part_start, part_length, part_end
+
+
+def get_empty_reason(flags, part_start, part_length, part_end, me_end):
+    """Return the reason why a partition has no data to work on, or None if
+    it has some"""
+
+    if flags & 0x7f == 2:
+        return "NVRAM partition, no data"
+    elif part_start == 0 or part_length == 0 or part_end > me_end:
+        return "no data here"
+
+    return None
+
+
+def is_partition_removed(part_name, whitelist, blacklist):
+    """Tell if a partition is going to be removed with the current
+    whitelist/blacklist"""
+
+    return not (part_name in whitelist or
+                (blacklist and part_name not in blacklist))
+
+
+def get_gen2_module_headers(f, offset, part_name):
+    """Return (module headers, None) of a generation 2 partition, or
+    (None, reason) if they can't be found"""
+
+    f.seek(offset + 0x20)
+    num_modules = unpack("<I", f.read(4))[0]
+    f.seek(offset + 0x290)
+    data = f.read(0x84)
+
+    mod_header_size = 0
+    if data[0x0:0x4] == b"$MME":
+        if data[0x60:0x64] == b"$MME" or num_modules == 1:
+            mod_header_size = 0x60
+        elif data[0x80:0x84] == b"$MME":
+            mod_header_size = 0x80
+
+    if mod_header_size == 0:
+        return None, "Can't find the module header size"
+
+    f.seek(offset + 0x290)
+    data = f.read(mod_header_size * num_modules)
+    mod_headers = [data[i * mod_header_size:(i + 1) * mod_header_size]
+                   for i in range(0, num_modules)]
+
+    if not all(hdr.startswith(b"$MME") for hdr in mod_headers):
+        return None, ("Found less modules than expected in the {} partition"
+                      .format(part_name))
+
+    return mod_headers, None
+
+
+def get_gen3_modules(f, partition_offset, partition_length):
+    """Return the modules of a generation 3 ($CPD) partition, sorted by
+    offset, as (name, start, end, compression type) tuples"""
+
+    f.seek(partition_offset + 0x4)
+    module_count = unpack("<I", f.read(4))[0]
+
+    modules = []
+    modules.append(("end", partition_length, 0))
+
+    f.seek(partition_offset + 0x10)
+    for i in range(0, module_count):
+        data = f.read(0x18)
+        name = data[0x0:0xc].rstrip(b"\x00").decode("ascii", "replace")
+        offset_block = unpack("<I", data[0xc:0x10])[0]
+        offset = offset_block & 0x01ffffff
+        comp_type = (offset_block & 0x02000000) >> 25
+
+        modules.append((name, offset, comp_type))
+
+    modules.sort(key=lambda x: x[1])
+
+    return [(modules[i][0],
+             partition_offset + modules[i][1],
+             partition_offset + modules[i + 1][1],
+             modules[i][2])
+            for i in range(0, module_count)]
+
+
+def get_partition_modules(f, gen, part_name, part_start, part_length):
+    """Return (modules, note).
+
+    modules is the list of the modules of a partition, as
+    (name, start, end, compression) tuples, or None if the partition doesn't
+    have a readable modules table (note says why). For the fragmented
+    (Huffman) modules of the generation 2 firmware start and end are None.
+    """
+
+    try:
+        if gen == 3:
+            f.seek(part_start)
+            if f.read(4) != b"$CPD":
+                return None, "not a code partition"
+
+            comp_str = ("LZMA/uncomp.", "Huffman")
+            modules = []
+
+            for name, start, end, comp_type in \
+                    get_gen3_modules(f, part_start, part_length):
+                if name.endswith(".man") or name.endswith(".met"):
+                    compression = "uncompressed"
+                else:
+                    compression = comp_str[comp_type]
+
+                modules.append((name, start, end, compression))
+
+            return modules, None
+
+        f.seek(part_start + 0x1c)
+        if f.read(4) != b"$MN2":
+            return None, "not a code partition"
+
+        mod_headers, reason = get_gen2_module_headers(f, part_start,
+                                                      part_name)
+        if mod_headers is None:
+            return None, reason
+
+        comp_str = ("uncomp.", "Huffman", "LZMA")
+        modules = []
+
+        for mod_header in mod_headers:
+            name = mod_header[0x04:0x14].rstrip(b"\x00").decode("ascii",
+                                                                "replace")
+            start = unpack("<I", mod_header[0x38:0x3C])[0] + part_start
+            size = unpack("<I", mod_header[0x40:0x44])[0]
+            flags = unpack("<I", mod_header[0x50:0x54])[0]
+            comp_type = (flags >> 4) & 7
+
+            if comp_type == 0x00 or comp_type == 0x02:
+                modules.append((name, start, start + size,
+                                comp_str[comp_type]))
+            elif comp_type == 0x01:
+                modules.append((name, None, None, comp_str[comp_type]))
+            else:
+                modules.append((name, None, None, "unknown"))
+
+        return modules, None
+
+    except (OutOfRegionException, struct.error):
+        return None, "can't read the partition"
+
+
+def list_modules(f, gen, entries, partitions, variant, version,
+                 me_start, me_end):
+    """Print the modules of all the partitions found in the ME/TXE region"""
+
+    print("Listing the modules of all the partitions...")
+
+    if gen == 1:
+        print(" Not supported on generation 1 firmware")
+        return
+
+    total = 0
+
+    for i in range(entries):
+        partition = partitions[i * 0x20:(i + 1) * 0x20]
+        part_name, flags, part_start, part_length, part_end = \
+            parse_partition_entry(partition, i == entries - 1, variant,
+                                  version, me_start, me_end)
+
+        empty_reason = get_empty_reason(flags, part_start, part_length,
+                                        part_end, me_end)
+
+        if empty_reason:
+            print(" {:<4} ({:^24}, 0x{:08x} total bytes): no modules"
+                  .format(part_name, empty_reason, part_length))
+            continue
+
+        print(" {:<4} (0x{:08x} - 0x{:09x}, 0x{:08x} total bytes): "
+              .format(part_name, part_start, part_end, part_length), end="")
+
+        modules, note = get_partition_modules(f, gen, part_name,
+                                              part_start, part_length)
+
+        if modules is None:
+            print("no modules ({})".format(note))
+            continue
+
+        total += len(modules)
+        print("{} module(s)".format(len(modules)))
+
+        for name, start, end, compression in modules:
+            if start is None:
+                location = "fragmented data"
+            else:
+                location = "0x{:06x} - 0x{:06x}".format(start, end)
+
+            print("   {:<16} ({:<12}, {})".format(name, compression,
+                                                  location))
+
+    print("Found {} module(s) in total".format(total))
+
+
+def check_keep_modules(f, gen, entries, partitions, variant, version,
+                       me_start, me_end, keep_modules, whitelist, blacklist):
+    """Exit if the modules to keep can't be kept: if they are not in the
+    image or if they are in a partition that is going to be removed"""
+
+    found = set()
+
+    for i in range(entries):
+        partition = partitions[i * 0x20:(i + 1) * 0x20]
+        part_name, flags, part_start, part_length, part_end = \
+            parse_partition_entry(partition, i == entries - 1, variant,
+                                  version, me_start, me_end)
+
+        if get_empty_reason(flags, part_start, part_length, part_end, me_end):
+            continue
+
+        modules, _ = get_partition_modules(f, gen, part_name, part_start,
+                                           part_length)
+        if modules is None:
+            continue
+
+        part_keep = sorted(keep_modules.intersection(m[0] for m in modules))
+        found.update(part_keep)
+
+        if part_keep and is_partition_removed(part_name, whitelist,
+                                              blacklist):
+            if blacklist:
+                reason = "it is in the blacklist"
+            else:
+                reason = ("it is not whitelisted, use -w {} to keep it"
+                          .format(part_name))
+
+            sys.exit("The {} partition is going to be removed ({}) but it "
+                     "contains the module(s) specified with -k: {}"
+                     .format(part_name, reason, ", ".join(part_keep)))
+
+    missing = sorted(keep_modules - found)
+    if missing:
+        sys.exit("Module(s) specified with -k not found in the ME/TXE "
+                 "image: {}".format(", ".join(missing)))
+
+
+def remove_modules(f, mod_headers, ftpr_offset, me_end, keep_modules):
     comp_str = ("uncomp.", "Huffman", "LZMA")
     unremovable_huff_chunks = []
     chunks_offsets = []
@@ -174,9 +450,11 @@ def remove_modules(f, mod_headers, ftpr_offset, me_end):
             print("0x{:06x} - 0x{:06x}       ): "
                   .format(offset, offset + size), end="")
 
-            if name in unremovable_modules:
+            if name in unremovable_modules or name in keep_modules:
                 end_addr = max(end_addr, offset + size)
-                print("NOT removed, essential")
+                print("NOT removed, " +
+                      ("essential" if name in unremovable_modules
+                       else "kept by user"))
             else:
                 end = min(offset + size, me_end)
                 f.fill_range(offset, end, b"\xff")
@@ -211,8 +489,10 @@ def remove_modules(f, mod_headers, ftpr_offset, me_end):
                   .format("~" + str(int(round(huff_size / 1024))) + " KiB"),
                   end="")
 
-            if name in unremovable_modules:
-                print("NOT removed, essential")
+            if name in unremovable_modules or name in keep_modules:
+                print("NOT removed, " +
+                      ("essential" if name in unremovable_modules
+                       else "kept by user"))
 
                 unremovable_huff_chunks += \
                     [x for x in chunks_offsets[first_chunk_num:
@@ -348,46 +628,21 @@ def relocate_partition(f, me_end, partition_header_offset,
 def check_and_remove_modules(f, me_end, offset, min_offset,
                              relocate, keep_modules):
 
-    f.seek(offset + 0x20)
-    num_modules = unpack("<I", f.read(4))[0]
-    f.seek(offset + 0x290)
-    data = f.read(0x84)
+    mod_headers, reason = get_gen2_module_headers(f, offset, "FTPR")
 
-    mod_header_size = 0
-    if data[0x0:0x4] == b"$MME":
-        if data[0x60:0x64] == b"$MME" or num_modules == 1:
-            mod_header_size = 0x60
-        elif data[0x80:0x84] == b"$MME":
-            mod_header_size = 0x80
+    if mod_headers is None:
+        print("{}; skipping modules removal".format(reason))
+        return -1, offset
 
-    if mod_header_size != 0:
-        f.seek(offset + 0x290)
-        data = f.read(mod_header_size * num_modules)
-        mod_headers = [data[i * mod_header_size:(i + 1) * mod_header_size]
-                       for i in range(0, num_modules)]
+    end_addr = remove_modules(f, mod_headers, offset, me_end, keep_modules)
 
-        if all(hdr.startswith(b"$MME") for hdr in mod_headers):
-            if args.keep_modules:
-                end_addr = offset + ftpr_length
-            else:
-                end_addr = remove_modules(f, mod_headers, offset, me_end)
+    if relocate:
+        new_offset = relocate_partition(f, me_end, 0x30, min_offset,
+                                        mod_headers)
+        end_addr += new_offset - offset
+        offset = new_offset
 
-            if args.relocate:
-                new_offset = relocate_partition(f, me_end, 0x30, min_offset,
-                                                mod_headers)
-                end_addr += new_offset - offset
-                offset = new_offset
-
-            return end_addr, offset
-
-        else:
-            print("Found less modules than expected in the FTPR "
-                  "partition; skipping modules removal")
-    else:
-        print("Can't find the module header size; skipping "
-              "modules removal")
-
-    return -1, offset
+    return end_addr, offset
 
 
 def check_and_remove_modules_gen3(f, me_end, partition_offset,
@@ -395,57 +650,35 @@ def check_and_remove_modules_gen3(f, me_end, partition_offset,
                                   keep_modules):
 
     comp_str = ("LZMA/uncomp.", "Huffman")
+    end_data = 0
 
-    if keep_modules:
-        end_data = partition_offset + partition_length
-    else:
-        end_data = 0
+    for name, offset, end, comp_type in \
+            get_gen3_modules(f, partition_offset, partition_length):
+        removed = False
 
-        f.seek(partition_offset + 0x4)
-        module_count = unpack("<I", f.read(4))[0]
+        if name.endswith(".man") or name.endswith(".met"):
+            compression = "uncompressed"
+        else:
+            compression = comp_str[comp_type]
 
-        modules = []
-        modules.append(("end", partition_length, 0))
+        print(" {:<12} ({:<12}, 0x{:06x} - 0x{:06x}): "
+              .format(name, compression, offset, end), end="")
 
-        f.seek(partition_offset + 0x10)
-        for i in range(0, module_count):
-            data = f.read(0x18)
-            name = data[0x0:0xc].rstrip(b"\x00").decode("ascii")
-            offset_block = unpack("<I", data[0xc:0x10])[0]
-            offset = offset_block & 0x01ffffff
-            comp_type = (offset_block & 0x02000000) >> 25
+        if name.endswith(".man"):
+            print("NOT removed, partition manif.")
+        elif name.endswith(".met"):
+            print("NOT removed, module metadata")
+        elif any(name.startswith(m) for m in unremovable_modules_gen3):
+            print("NOT removed, essential")
+        elif name in keep_modules:
+            print("NOT removed, kept by user")
+        else:
+            removed = True
+            f.fill_range(offset, min(end, me_end), b"\xff")
+            print("removed")
 
-            modules.append((name, offset, comp_type))
-
-        modules.sort(key=lambda x: x[1])
-
-        for i in range(0, module_count):
-            name = modules[i][0]
-            offset = partition_offset + modules[i][1]
-            end = partition_offset + modules[i + 1][1]
-            removed = False
-
-            if name.endswith(".man") or name.endswith(".met"):
-                compression = "uncompressed"
-            else:
-                compression = comp_str[modules[i][2]]
-
-            print(" {:<12} ({:<12}, 0x{:06x} - 0x{:06x}): "
-                  .format(name, compression, offset, end), end="")
-
-            if name.endswith(".man"):
-                print("NOT removed, partition manif.")
-            elif name.endswith(".met"):
-                print("NOT removed, module metadata")
-            elif any(name.startswith(m) for m in unremovable_modules_gen3):
-                print("NOT removed, essential")
-            else:
-                removed = True
-                f.fill_range(offset, min(end, me_end), b"\xff")
-                print("removed")
-
-            if not removed:
-                end_data = max(end_data, end)
+        if not removed:
+            end_data = max(end_data, end)
 
     if relocate:
         new_offset = relocate_partition(f, me_end, 0x30, min_offset, [])
@@ -503,8 +736,13 @@ if __name__ == "__main__":
     parser.add_argument("-t", "--truncate", help="truncate the empty part of "
                         "the firmware (requires a separated ME/TXE image or "
                         "--extract-me)", action="store_true")
-    parser.add_argument("-k", "--keep-modules", help="don't remove the FTPR "
-                        "modules, even when possible", action="store_true")
+    parser.add_argument("-k", "--keep-modules", metavar="modules",
+                        help="comma separated list of modules to keep in the "
+                        "final image, regardless of which partition they are "
+                        "in (e.g. MODULE_A,MODULE_B). The partitions which "
+                        "contain them must not be removed (see -w and -b), "
+                        "otherwise the program exits with an error. Use -c "
+                        "to list the modules of the image")
     bw_list.add_argument("-w", "--whitelist", metavar="whitelist",
                          help="Comma separated list of additional partitions "
                          "to keep in the final image. This can be used to "
@@ -527,7 +765,8 @@ if __name__ == "__main__":
                         help="extract the ME firmware from a full dump; when "
                         "used with --truncate save a truncated ME/TXE image")
     parser.add_argument("-c", "--check", help="verify the integrity of the "
-                        "fundamental parts of the firmware and exit",
+                        "fundamental parts of the firmware, list the modules "
+                        "of all the partitions and exit",
                         action="store_true")
 
     args = parser.parse_args()
@@ -542,6 +781,16 @@ if __name__ == "__main__":
     if (args.whitelist or args.blacklist) and args.relocate:
         sys.exit("Relocation is not yet supported with custom whitelist or "
                  "blacklist")
+
+    keep_modules = parse_keep_modules(args.keep_modules)
+
+    whitelist = list(unremovable_partitions)
+    blacklist = []
+
+    if args.blacklist:
+        blacklist = args.blacklist.split(",")
+    elif args.whitelist:
+        whitelist += args.whitelist.split(",")
 
     gen = None
 
@@ -696,6 +945,17 @@ if __name__ == "__main__":
                   "maintainer!"
                   .format(pubkey_md5, variant))
 
+        # Check the modules to keep before touching anything (and before
+        # creating the output file)
+        if keep_modules and not args.check and not args.soft_disable_only:
+            if gen == 1:
+                sys.exit("-k is not supported with generation 1 firmware "
+                         "(the whole ME region is wiped)")
+
+            check_keep_modules(mef, gen, entries, partitions, variant,
+                               version, me_start, me_end, keep_modules,
+                               whitelist, blacklist)
+
     if not args.check and args.output:
         f.close()
         shutil.copy(args.file, args.output)
@@ -741,6 +1001,11 @@ if __name__ == "__main__":
             mef = RegionFile(f, me_start, me_end)
             mef.fill_all("\xff")
 
+    # Check mode: list the modules of all the partitions
+    if args.check and me_start < me_end:
+        list_modules(mef, gen, entries, partitions, variant, version,
+                     me_start, me_end)
+
     # ME 6 Ignition: wipe everything
     me6_ignition = False
     if gen == 2 and not args.check and not args.soft_disable_only and \
@@ -751,6 +1016,10 @@ if __name__ == "__main__":
         data = mef.read(0xc)
 
         if data[0x0:0x4] == b"$SKU" and data[0x8:0xc] == b"\x00\x00\x00\x00":
+            if keep_modules:
+                sys.exit("-k can't be used with ME 6 Ignition firmware (the "
+                         "whole ME region is wiped)")
+
             print("ME 6 Ignition firmware detected, removing everything...")
             mef.fill_all(b"\xff")
             me6_ignition = True
@@ -760,50 +1029,26 @@ if __name__ == "__main__":
             print("Reading partitions list...")
             unremovable_part_fpt = b""
             extra_part_end = 0
-            whitelist = []
-            blacklist = []
-
-            whitelist += unremovable_partitions
-
-            if args.blacklist:
-                blacklist = args.blacklist.split(",")
-            elif args.whitelist:
-                whitelist += args.whitelist.split(",")
 
             for i in range(entries):
                 partition = partitions[i * 0x20:(i + 1) * 0x20]
-                flags = unpack("<I", partition[0x1c:0x20])[0]
+                part_name, flags, part_start, part_length, part_end = \
+                    parse_partition_entry(partition, i == entries - 1,
+                                          variant, version, me_start, me_end)
 
-                try:
-                    part_name = \
-                        partition[0x0:0x4].rstrip(b"\x00").decode("ascii")
-                except UnicodeDecodeError:
-                    part_name = "????"
+                empty_reason = get_empty_reason(flags, part_start,
+                                                part_length, part_end, me_end)
 
-                part_start, part_length = unpack("<II", partition[0x08:0x10])
-
-                # ME 6: the last partition has 0xffffffff as size
-                if variant == "ME" and version[0] == 6 and \
-                   i == entries - 1 and part_length == 0xffffffff:
-                    part_length = me_end - me_start - part_start
-
-                part_end = part_start + part_length
-
-                if flags & 0x7f == 2:
+                if empty_reason:
                     print(" {:<4} ({:^24}, 0x{:08x} total bytes): nothing to "
                           "remove"
-                          .format(part_name, "NVRAM partition, no data",
-                                  part_length))
-                elif part_start == 0 or part_length == 0 or part_end > me_end:
-                    print(" {:<4} ({:^24}, 0x{:08x} total bytes): nothing to "
-                          "remove"
-                          .format(part_name, "no data here", part_length))
+                          .format(part_name, empty_reason, part_length))
                 else:
                     print(" {:<4} (0x{:08x} - 0x{:09x}, 0x{:08x} total bytes): "
                           .format(part_name, part_start, part_end, part_length),
                           end="")
-                    if part_name in whitelist or (blacklist and
-                       part_name not in blacklist):
+                    if not is_partition_removed(part_name, whitelist,
+                                                blacklist):
                         unremovable_part_fpt += partition
                         if part_name != "FTPR":
                             extra_part_end = max(extra_part_end, part_end)
@@ -852,12 +1097,12 @@ if __name__ == "__main__":
                                                   ftpr_offset, ftpr_length,
                                                   min_ftpr_offset,
                                                   args.relocate,
-                                                  args.keep_modules)
+                                                  keep_modules)
             else:
                 end_addr, ftpr_offset = \
                     check_and_remove_modules(mef, me_end, ftpr_offset,
                                              min_ftpr_offset, args.relocate,
-                                             args.keep_modules)
+                                             keep_modules)
 
             if end_addr > 0:
                 end_addr = max(end_addr, extra_part_end)
@@ -959,4 +1204,3 @@ if __name__ == "__main__":
 
     if not args.check:
         print("Done! Good luck!")
-
